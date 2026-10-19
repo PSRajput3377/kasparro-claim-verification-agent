@@ -1,4 +1,6 @@
 
+"""Gemini-based factual claim extraction and verification agent."""
+
 import json
 import os
 import time
@@ -6,6 +8,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from langfuse import get_client
@@ -15,12 +18,16 @@ from .fact_tool import FactCatalogue, UnknownBrandError
 from .schemas import AcceptedClaim, AgentResult, ClaimDraft
 
 
-PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "v1.txt"
+ROOT = Path(__file__).resolve().parents[1]
+PROMPT_DIR = ROOT / "prompts"
 
 RETRY_DELAY_SECONDS = 2
 MAX_ATTEMPTS = 2
 REQUEST_TIMEOUT_MS = 15_000
 MAX_MODEL_TURNS = 3
+SUPPORTED_PROMPT_VERSIONS = {"v1", "v2"}
+
+load_dotenv(ROOT / ".env")
 
 
 class AgentError(RuntimeError):
@@ -28,7 +35,7 @@ class AgentError(RuntimeError):
 
 
 def _get_langfuse_client():
-    """Return a Langfuse client when tracing credentials are configured."""
+    """Return a Langfuse client only when credentials are configured."""
     if not (
         os.getenv("LANGFUSE_PUBLIC_KEY")
         and os.getenv("LANGFUSE_SECRET_KEY")
@@ -47,20 +54,32 @@ class GeminiClaimAgent:
         self,
         catalogue: FactCatalogue | None = None,
         model: str | None = None,
+        prompt_version: str = "v1",
     ):
+        if prompt_version not in SUPPORTED_PROMPT_VERSIONS:
+            raise ValueError(
+                f"Unsupported prompt version: {prompt_version!r}. "
+                f"Choose one of {sorted(SUPPORTED_PROMPT_VERSIONS)}."
+            )
+
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise AgentError(
                 "GEMINI_API_KEY is missing. "
-                "Copy .env.example to .env and add your key."
+                "Add it to your .env file."
             )
+
+        prompt_path = PROMPT_DIR / f"{prompt_version}.txt"
+        if not prompt_path.is_file():
+            raise AgentError(f"Prompt file not found: {prompt_path}")
 
         self.client = genai.Client(api_key=api_key)
         self.model = model or os.getenv(
             "GEMINI_MODEL", "gemini-2.5-flash"
         )
         self.catalogue = catalogue or FactCatalogue()
-        self.system_instruction = PROMPT_PATH.read_text(
+        self.prompt_version = prompt_version
+        self.system_instruction = prompt_path.read_text(
             encoding="utf-8"
         )
         self.langfuse = _get_langfuse_client()
@@ -96,7 +115,7 @@ class GeminiClaimAgent:
         metadata: dict[str, Any] | None = None,
         model: str | None = None,
     ):
-        """Create an observation context, or a no-op context if disabled."""
+        """Create an observation context or a no-op context."""
         if self.langfuse is None:
             return nullcontext(None)
 
@@ -110,9 +129,10 @@ class GeminiClaimAgent:
             if model is not None:
                 kwargs["model"] = model
 
-            return self.langfuse.start_as_current_observation(**kwargs)
+            return self.langfuse.start_as_current_observation(
+                **kwargs
+            )
         except Exception:
-            # Keep telemetry initialization failures from blocking work.
             return nullcontext(None)
 
     @staticmethod
@@ -122,7 +142,7 @@ class GeminiClaimAgent:
         output: dict[str, Any] | None = None,
         error: Exception | None = None,
     ) -> None:
-        """Update telemetry without allowing tracing errors to break the agent."""
+        """Update tracing metadata without breaking the agent."""
         if observation is None:
             return
 
@@ -184,9 +204,7 @@ class GeminiClaimAgent:
             "CONNECTION ERROR",
         )
 
-        return any(
-            marker in error_text for marker in transient_markers
-        )
+        return any(marker in error_text for marker in transient_markers)
 
     def _generate_with_retry(self, contents: list[Any]) -> Any:
         config = types.GenerateContentConfig(
@@ -209,6 +227,7 @@ class GeminiClaimAgent:
                 metadata={
                     "timeout_ms": REQUEST_TIMEOUT_MS,
                     "tool_enabled": True,
+                    "prompt_version": self.prompt_version,
                 },
                 model=self.model,
             ) as observation:
@@ -252,12 +271,10 @@ class GeminiClaimAgent:
                             f"Original error: {type(exc).__name__}: {exc}"
                         ) from exc
 
-                    should_retry = self._is_transient_error(
-                        error_text
-                    )
-                    is_first_attempt = attempt == 0
-
-                    if should_retry and is_first_attempt:
+                    if (
+                        self._is_transient_error(error_text)
+                        and attempt == 0
+                    ):
                         time.sleep(RETRY_DELAY_SECONDS)
                         continue
 
@@ -285,7 +302,7 @@ class GeminiClaimAgent:
             key: answer[key] for key in required_fields
         }
 
-        # Avoid sending the full question or answer to Langfuse.
+        # Avoid recording the full question or answer in Langfuse.
         with self._observation(
             name="claim-classification",
             input_data={
@@ -294,6 +311,7 @@ class GeminiClaimAgent:
             },
             metadata={
                 "model": self.model,
+                "prompt_version": self.prompt_version,
                 "max_model_turns": MAX_MODEL_TURNS,
             },
         ) as root_observation:
@@ -372,13 +390,12 @@ class GeminiClaimAgent:
                         metadata={
                             "tool": "get_brand_facts",
                             "model_turn": turn_index + 1,
+                            "prompt_version": self.prompt_version,
                         },
                     ) as observation:
                         try:
-                            result = (
-                                self.catalogue.get_brand_facts(
-                                    brand_id
-                                )
+                            result = self.catalogue.get_brand_facts(
+                                brand_id
                             )
                             self._finish_observation(
                                 observation,
@@ -415,7 +432,6 @@ class GeminiClaimAgent:
                 continue
 
             final_text = (response.text or "").strip()
-
             if final_text:
                 break
 
@@ -505,21 +521,17 @@ class GeminiClaimAgent:
         last_start = -1
 
         for draft in drafts:
-            if any(
-                fact_id not in allowed_fact_ids
+            bad_ids = [
+                fact_id
                 for fact_id in draft.fact_ids
-            ):
-                bad_ids = [
-                    fact_id
-                    for fact_id in draft.fact_ids
-                    if fact_id not in allowed_fact_ids
-                ]
+                if fact_id not in allowed_fact_ids
+            ]
+            if bad_ids:
                 raise AgentError(
                     f"Invented or unknown fact IDs: {bad_ids}"
                 )
 
             quote = draft.quote
-
             if not quote:
                 raise AgentError("Claim quote cannot be empty")
 
