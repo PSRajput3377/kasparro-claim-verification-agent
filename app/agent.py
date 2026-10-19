@@ -2,11 +2,13 @@
 import json
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from google import genai
 from google.genai import types
+from langfuse import get_client
 from pydantic import ValidationError
 
 from .fact_tool import FactCatalogue, UnknownBrandError
@@ -15,7 +17,6 @@ from .schemas import AcceptedClaim, AgentResult, ClaimDraft
 
 PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "v1.txt"
 
-# Retry only after a short, bounded delay.
 RETRY_DELAY_SECONDS = 2
 MAX_ATTEMPTS = 2
 REQUEST_TIMEOUT_MS = 15_000
@@ -24,6 +25,21 @@ MAX_MODEL_TURNS = 3
 
 class AgentError(RuntimeError):
     """Raised when the agent cannot produce a valid result."""
+
+
+def _get_langfuse_client():
+    """Return a Langfuse client when tracing credentials are configured."""
+    if not (
+        os.getenv("LANGFUSE_PUBLIC_KEY")
+        and os.getenv("LANGFUSE_SECRET_KEY")
+    ):
+        return None
+
+    try:
+        return get_client()
+    except Exception:
+        # Observability must not prevent claim verification from running.
+        return None
 
 
 class GeminiClaimAgent:
@@ -47,15 +63,16 @@ class GeminiClaimAgent:
         self.system_instruction = PROMPT_PATH.read_text(
             encoding="utf-8"
         )
+        self.langfuse = _get_langfuse_client()
 
         self.tool = types.Tool(
             function_declarations=[
                 types.FunctionDeclaration(
                     name="get_brand_facts",
                     description=(
-                        "Read-only lookup of all supplied catalogue fact "
-                        "rows for one known brand. Use this before "
-                        "classifying claims."
+                        "Read-only lookup of all supplied catalogue "
+                        "fact rows for one known brand. Use this "
+                        "before classifying claims."
                     ),
                     parameters=types.Schema(
                         type=types.Type.OBJECT,
@@ -70,12 +87,60 @@ class GeminiClaimAgent:
             ]
         )
 
+    def _observation(
+        self,
+        *,
+        name: str,
+        as_type: str = "span",
+        input_data: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        model: str | None = None,
+    ):
+        """Create an observation context, or a no-op context if disabled."""
+        if self.langfuse is None:
+            return nullcontext(None)
+
+        try:
+            kwargs: dict[str, Any] = {
+                "name": name,
+                "as_type": as_type,
+                "input": input_data or {},
+                "metadata": metadata or {},
+            }
+            if model is not None:
+                kwargs["model"] = model
+
+            return self.langfuse.start_as_current_observation(**kwargs)
+        except Exception:
+            # Keep telemetry initialization failures from blocking work.
+            return nullcontext(None)
+
+    @staticmethod
+    def _finish_observation(
+        observation: Any,
+        *,
+        output: dict[str, Any] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        """Update telemetry without allowing tracing errors to break the agent."""
+        if observation is None:
+            return
+
+        try:
+            if error is not None:
+                observation.update(
+                    level="ERROR",
+                    status_message=(
+                        f"{type(error).__name__}: {error}"
+                    )[:500],
+                )
+            elif output is not None:
+                observation.update(output=output)
+        except Exception:
+            pass
+
     @staticmethod
     def _is_daily_quota_exhausted(error_text: str) -> bool:
-        """
-        Identify exhausted daily quotas that will not recover by
-        waiting a couple of seconds.
-        """
         daily_markers = (
             "GENERATEREQUESTSPERDAY",
             "REQUESTS PER DAY",
@@ -87,9 +152,6 @@ class GeminiClaimAgent:
         if any(marker in error_text for marker in daily_markers):
             return True
 
-        # A generic quota error can also mean a per-minute limit.
-        # Only treat it as permanent here when it is not a per-minute
-        # or per-minute-token limit.
         generic_quota = (
             "QUOTA EXCEEDED" in error_text
             or "QUOTA_EXCEEDED" in error_text
@@ -105,11 +167,6 @@ class GeminiClaimAgent:
 
     @classmethod
     def _is_transient_error(cls, error_text: str) -> bool:
-        """
-        Return True for errors that may recover with one short retry.
-
-        Daily quota exhaustion is deliberately excluded.
-        """
         if cls._is_daily_quota_exhausted(error_text):
             return False
 
@@ -142,35 +199,72 @@ class GeminiClaimAgent:
         )
 
         for attempt in range(MAX_ATTEMPTS):
-            try:
-                return self.client.models.generate_content(
-                    model=self.model,
-                    contents=contents,
-                    config=config,
-                )
+            with self._observation(
+                name="gemini-generate-content",
+                as_type="generation",
+                input_data={
+                    "attempt": attempt + 1,
+                    "max_attempts": MAX_ATTEMPTS,
+                },
+                metadata={
+                    "timeout_ms": REQUEST_TIMEOUT_MS,
+                    "tool_enabled": True,
+                },
+                model=self.model,
+            ) as observation:
+                try:
+                    response = self.client.models.generate_content(
+                        model=self.model,
+                        contents=contents,
+                        config=config,
+                    )
 
-            except Exception as exc:
-                error_text = f"{type(exc).__name__}: {exc}".upper()
+                    self._finish_observation(
+                        observation,
+                        output={
+                            "success": True,
+                            "candidate_count": len(
+                                response.candidates or []
+                            ),
+                            "tool_call_count": len(
+                                response.function_calls or []
+                            ),
+                            "has_text": bool(response.text),
+                        },
+                    )
+                    return response
 
-                if self._is_daily_quota_exhausted(error_text):
+                except Exception as exc:
+                    error_text = (
+                        f"{type(exc).__name__}: {exc}"
+                    ).upper()
+
+                    self._finish_observation(
+                        observation,
+                        error=exc,
+                    )
+
+                    if self._is_daily_quota_exhausted(error_text):
+                        raise AgentError(
+                            "Gemini daily quota is exhausted. "
+                            "The request was not retried because a "
+                            "short delay will not restore the quota. "
+                            f"Original error: {type(exc).__name__}: {exc}"
+                        ) from exc
+
+                    should_retry = self._is_transient_error(
+                        error_text
+                    )
+                    is_first_attempt = attempt == 0
+
+                    if should_retry and is_first_attempt:
+                        time.sleep(RETRY_DELAY_SECONDS)
+                        continue
+
                     raise AgentError(
-                        "Gemini daily quota is exhausted. "
-                        "The request was not retried because waiting "
-                        f"{RETRY_DELAY_SECONDS} seconds will not help. "
-                        f"Original error: {type(exc).__name__}: {exc}"
+                        "Gemini request failed: "
+                        f"{type(exc).__name__}: {exc}"
                     ) from exc
-
-                should_retry = self._is_transient_error(error_text)
-                is_first_attempt = attempt == 0
-
-                if should_retry and is_first_attempt:
-                    time.sleep(RETRY_DELAY_SECONDS)
-                    continue
-
-                raise AgentError(
-                    f"Gemini request failed: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
 
         raise AgentError("Gemini request failed after retry")
 
@@ -191,15 +285,50 @@ class GeminiClaimAgent:
             key: answer[key] for key in required_fields
         }
 
+        # Avoid sending the full question or answer to Langfuse.
+        with self._observation(
+            name="claim-classification",
+            input_data={
+                "answer_id": answer["answer_id"],
+                "brand_id": answer["brand_id"],
+            },
+            metadata={
+                "model": self.model,
+                "max_model_turns": MAX_MODEL_TURNS,
+            },
+        ) as root_observation:
+            try:
+                result = self._classify_payload(user_payload)
+
+                self._finish_observation(
+                    root_observation,
+                    output={
+                        "answer_id": result.answer_id,
+                        "claim_count": len(result.claims),
+                        "success": True,
+                    },
+                )
+                return result
+
+            except Exception as exc:
+                self._finish_observation(
+                    root_observation,
+                    error=exc,
+                )
+                raise
+
+    def _classify_payload(
+        self,
+        answer: dict[str, str],
+    ) -> AgentResult:
         contents: list[Any] = [
-            json.dumps(user_payload, ensure_ascii=False)
+            json.dumps(answer, ensure_ascii=False)
         ]
 
         final_text: str | None = None
         response: Any = None
 
-        # Allow a bounded number of model turns for tool use.
-        for _ in range(MAX_MODEL_TURNS):
+        for turn_index in range(MAX_MODEL_TURNS):
             response = self._generate_with_retry(contents)
 
             candidate = (
@@ -213,10 +342,7 @@ class GeminiClaimAgent:
                     "Gemini returned no candidate content"
                 )
 
-            # Preserve the model's response in the conversation so
-            # the tool call and its result are part of the live flow.
             contents.append(candidate)
-
             calls = list(response.function_calls or [])
 
             if calls:
@@ -240,12 +366,38 @@ class GeminiClaimAgent:
                             "non-empty brand_id"
                         )
 
-                    try:
-                        result = self.catalogue.get_brand_facts(
-                            brand_id
-                        )
-                    except UnknownBrandError as exc:
-                        raise AgentError(str(exc)) from exc
+                    with self._observation(
+                        name="get_brand_facts",
+                        input_data={"brand_id": brand_id},
+                        metadata={
+                            "tool": "get_brand_facts",
+                            "model_turn": turn_index + 1,
+                        },
+                    ) as observation:
+                        try:
+                            result = (
+                                self.catalogue.get_brand_facts(
+                                    brand_id
+                                )
+                            )
+                            self._finish_observation(
+                                observation,
+                                output={
+                                    "success": True,
+                                    "fact_count": len(
+                                        result.get("facts", [])
+                                    ),
+                                    "fact_version": result.get(
+                                        "fact_version"
+                                    ),
+                                },
+                            )
+                        except UnknownBrandError as exc:
+                            self._finish_observation(
+                                observation,
+                                error=exc,
+                            )
+                            raise AgentError(str(exc)) from exc
 
                     tool_responses.append(
                         types.Part.from_function_response(
@@ -292,7 +444,6 @@ class GeminiClaimAgent:
                 f"Candidate details: {candidate_info}"
             )
 
-        # Support JSON enclosed in Markdown code fences.
         if final_text.startswith("```"):
             lines = final_text.splitlines()
 
@@ -354,7 +505,6 @@ class GeminiClaimAgent:
         last_start = -1
 
         for draft in drafts:
-            # Reject any catalogue IDs that do not exist.
             if any(
                 fact_id not in allowed_fact_ids
                 for fact_id in draft.fact_ids
@@ -373,8 +523,6 @@ class GeminiClaimAgent:
             if not quote:
                 raise AgentError("Claim quote cannot be empty")
 
-            # Find an exact occurrence after the previous claim's
-            # starting position.
             start = source.find(quote, last_start + 1)
 
             while (
